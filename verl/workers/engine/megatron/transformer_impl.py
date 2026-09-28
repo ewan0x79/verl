@@ -720,10 +720,11 @@ class MegatronEngine(BaseEngine):
     def get_context_parallel_group(self):
         return mpu.get_context_parallel_group()
 
-    def finalize_async_checkpointing(self, blocking: bool = False) -> None:
-        """Finalize queued Megatron saves from rank-aligned trainer control flow."""
+    def finalize_async_checkpointing(self, blocking: bool = False) -> bool:
+        """Finalize queued saves on every rank and report whether all writes finished."""
         if self.checkpoint_config.async_save:
-            self.checkpoint_mananager.finalize_async_checkpointing(blocking=blocking)
+            return self.checkpoint_mananager.finalize_async_checkpointing(blocking=blocking)
+        return True
 
     def save_checkpoint(
         self,
@@ -746,7 +747,11 @@ class MegatronEngine(BaseEngine):
         if self._is_offload_param or origin_module_device == "cpu":
             load_megatron_model_to_gpu(self.module, load_grad=True)
         self.checkpoint_mananager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+            update_tracker=kwargs.get("update_tracker", True),
         )
         torch.distributed.barrier()
         if self._is_offload_param:

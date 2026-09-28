@@ -270,8 +270,8 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def finalize_async_checkpointing(self, blocking: bool = False) -> None:
-        """Complete pending asynchronous checkpoint writes, if supported."""
+    def finalize_async_checkpointing(self, blocking: bool = False) -> bool:
+        """Complete pending async writes and return whether all finished, if supported."""
         raise NotImplementedError(f"{type(self).__name__} does not support checkpoint.async_save")
 
     def load_checkpoint(

@@ -441,8 +441,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         return final_output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
-        return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, **kwargs):
+        return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def finalize_async_checkpointing(self, blocking=False):
@@ -725,9 +725,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, **kwargs):
         assert "actor" in self.role, "save_checkpoint only support actor role"
-        self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+        self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def finalize_async_checkpointing(self, blocking=False):
+        """Finalize actor checkpoint writes on every training rank."""
+        assert "actor" in self.role, "finalize_async_checkpointing only supports the actor role"
+        return self.actor.finalize_async_checkpointing(blocking=blocking)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
