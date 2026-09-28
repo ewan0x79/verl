@@ -955,7 +955,7 @@ class PPOTrainer(ABC):
 
         async_checkpoint = prepare_async_checkpoint(self)
         # The driver publishes one tracker after actor, critic and auxiliary state finish.
-        save_kwargs = {"update_tracker": False} if async_checkpoint is not None else {}
+        save_kwargs = {"update_tracker": False, "defer_retention": True} if async_checkpoint is not None else {}
 
         local_global_step_folder = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"

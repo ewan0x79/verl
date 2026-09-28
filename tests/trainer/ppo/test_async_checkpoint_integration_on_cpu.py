@@ -65,6 +65,7 @@ def test_save_defers_shared_tracker_until_both_roles_and_data_finish(trainer, tm
     assert not tracker.exists()
     for worker in (trainer.actor_rollout_wg, trainer.critic_wg):
         assert worker.save_checkpoint.call_args.kwargs["update_tracker"] is False
+        assert worker.save_checkpoint.call_args.kwargs["defer_retention"] is True
     finalize_async_checkpoint(trainer, blocking=True)
     assert tracker.read_text() == "3"
     assert trainer.actor_rollout_wg.finalize_async_checkpointing.called == actor_async

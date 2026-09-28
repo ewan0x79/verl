@@ -111,3 +111,17 @@ def test_blocking_drain_requires_completion_acknowledgements(tmp_path, results):
     with pytest.raises(RuntimeError, match="pending writes"):
         finalize_async_checkpoint(trainer, blocking=True)
     assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
+
+
+@pytest.mark.parametrize("remove_previous", [False, True])
+def test_retention_includes_sync_roles_and_preserves_configured_limits(tmp_path, remove_previous):
+    trainer = make_trainer(tmp_path, critic_async=False)
+    trainer.config.trainer.max_actor_ckpt_to_keep = 2
+    trainer.config.trainer.max_critic_ckpt_to_keep = 3
+    trainer.config.trainer.remove_previous_ckpt_in_save = remove_previous
+    coordinator = prepare_async_checkpoint(trainer)
+    coordinator.pending_step = 3
+    finalize_async_checkpoint(trainer, blocking=True)
+    trainer.actor_rollout_wg.prune_checkpoints.assert_called_once_with(max_ckpt_to_keep=1 if remove_previous else 2)
+    trainer.critic_wg.prune_checkpoints.assert_called_once_with(max_ckpt_to_keep=1 if remove_previous else 3)
+    trainer.critic_wg.finalize_async_checkpointing.assert_not_called()

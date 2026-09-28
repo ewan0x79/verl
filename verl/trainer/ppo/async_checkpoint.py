@@ -19,14 +19,16 @@ import os
 class AsyncCheckpointCoordinator:
     """Publish a PPO checkpoint only after all participating workers finish.
 
-    Keep at most one checkpoint in flight: a subsequent save drains the previous
-    one before worker retention callbacks can remove its files. Worker RPCs fan
-    out to every rank; only the driver publishes the shared resume tracker.
+    Keep at most one checkpoint in flight. Worker RPCs fan out to every rank;
+    only the driver publishes the shared resume tracker. Retention runs after
+    publication, so an interruption may leave extra files but preserves the
+    checkpoint selected by the tracker.
     """
 
-    def __init__(self, worker_groups, checkpoint_dir):
+    def __init__(self, worker_groups, checkpoint_dir, retention=None):
         self.worker_groups = worker_groups
         self.checkpoint_dir = checkpoint_dir
+        self.retention = retention if retention is not None else []
         self.pending_step = None
 
     def finalize(self, blocking=False):
@@ -45,6 +47,10 @@ class AsyncCheckpointCoordinator:
             with open(tracker + ".tmp", "w") as f:
                 f.write(str(self.pending_step))
             os.replace(tracker + ".tmp", tracker)
+            # Include synchronous roles: their old files were also protected during save.
+            # If cleanup fails, leave pending_step set so the next drain can retry safely.
+            for worker_group, max_ckpt_to_keep in self.retention:
+                worker_group.prune_checkpoints(max_ckpt_to_keep=max_ckpt_to_keep)
             self.pending_step = None
 
 
@@ -59,7 +65,14 @@ def prepare_async_checkpoint(trainer):
             worker_groups.append(trainer.critic_wg)
         if not worker_groups:
             return None
-        coordinator = AsyncCheckpointCoordinator(worker_groups, trainer.config.trainer.default_local_dir)
+        trainer_config = trainer.config.trainer
+        remove_previous = trainer_config.get("remove_previous_ckpt_in_save", False)
+        retention = [(trainer.actor_rollout_wg, 1 if remove_previous else trainer_config.get("max_actor_ckpt_to_keep"))]
+        if trainer.use_critic:
+            retention.append(
+                (trainer.critic_wg, 1 if remove_previous else trainer_config.get("max_critic_ckpt_to_keep"))
+            )
+        coordinator = AsyncCheckpointCoordinator(worker_groups, trainer_config.default_local_dir, retention)
         trainer._async_checkpoint_coordinator = coordinator
     coordinator.finalize(blocking=True)
     return coordinator

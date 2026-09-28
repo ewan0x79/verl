@@ -441,8 +441,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
         return final_output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, **kwargs):
+    def save_checkpoint(
+        self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, defer_retention=False, **kwargs
+    ):
+        if defer_retention:
+            if not self.engine.supports_deferred_checkpoint_retention:
+                raise NotImplementedError(
+                    f"{type(self.engine).__name__} does not support deferred checkpoint retention"
+                )
+            # Disable both pre-save capacity checks and post-write deletion.
+            max_ckpt_to_keep = None
         return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prune_checkpoints(self, max_ckpt_to_keep=None):
+        """Apply retention on every rank after the driver publishes the tracker."""
+        return self.engine.prune_checkpoints(max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def finalize_async_checkpointing(self, blocking=False):
@@ -728,6 +742,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None, **kwargs):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep, **kwargs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prune_checkpoints(self, max_ckpt_to_keep=None):
+        """Prune actor checkpoints after the shared tracker has been published."""
+        assert "actor" in self.role, "prune_checkpoints only supports the actor role"
+        return self.actor.prune_checkpoints(max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def finalize_async_checkpointing(self, blocking=False):

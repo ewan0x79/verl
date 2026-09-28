@@ -986,7 +986,7 @@ class RayPPOTrainer:
 
         async_checkpoint = prepare_async_checkpoint(self)
         # The driver publishes one tracker after actor, critic and auxiliary state finish.
-        save_kwargs = {"update_tracker": False} if async_checkpoint is not None else {}
+        save_kwargs = {"update_tracker": False, "defer_retention": True} if async_checkpoint is not None else {}
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(
