@@ -46,10 +46,17 @@ class CheckpointWorker:
             prune_checkpoints=self.manager.prune_checkpoints,
         )
         self.worker = SimpleNamespace(engine=engine)
+        self.step = 2
+        self.start_save(2)
+
+    def start_save(self, step):
+        self.step = step
+        self.ready = False
+        self.registered = False
         TrainingWorker.save_checkpoint(
             self.worker,
-            str(root / "global_step_2" / role),
-            global_step=2,
+            str(self.root / f"global_step_{step}" / self.role),
+            global_step=step,
             max_ckpt_to_keep=1,
             defer_retention=True,
             update_tracker=False,
@@ -63,7 +70,7 @@ class CheckpointWorker:
 
     def complete_write(self):
         if not self.registered:
-            new = self.root / "global_step_2" / self.role
+            new = self.root / f"global_step_{self.step}" / self.role
             new.mkdir(parents=True, exist_ok=True)
             (new / "weights").write_text("new")
             # TrainingWorker disables retention until the coordinator publishes the tracker.
@@ -77,7 +84,7 @@ class CheckpointWorker:
 
     def prune_checkpoints(self, max_ckpt_to_keep):
         # Every destructive call must observe the new complete checkpoint as published.
-        assert (self.root / "latest_checkpointed_iteration.txt").read_text() == "2"
+        assert (self.root / "latest_checkpointed_iteration.txt").read_text() == str(self.step)
         self.prune_calls += 1
         TrainingWorker.prune_checkpoints(self.worker, max_ckpt_to_keep=max_ckpt_to_keep)
 
@@ -119,6 +126,34 @@ def test_keep_one_preserves_old_checkpoint_while_other_role_is_pending(tmp_path,
     for role in roles:
         assert not (tmp_path / "global_step_1" / role.role).exists()
         assert len(role.manager.previous_saved_paths) == 1
+
+
+def test_keep_one_prunes_each_previous_actor_only_after_three_step_publication(tmp_path):
+    coordinator, roles = setup_checkpoint(tmp_path, actor_only=True)
+    actor = roles[0]
+
+    coordinator.finalize()
+    assert_recoverable(tmp_path, roles, 1)
+    assert actor.prune_calls == 0
+    actor.ready = True
+    coordinator.finalize()
+    assert_recoverable(tmp_path, roles, 2)
+    assert not (tmp_path / "global_step_1/actor").exists()
+
+    (tmp_path / "global_step_3").mkdir()
+    (tmp_path / "global_step_3/data.pt").write_text("third dataloader")
+    actor.start_save(3)
+    coordinator.pending_step = 3
+    coordinator.finalize()
+    assert_recoverable(tmp_path, roles, 2)
+    assert actor.prune_calls == 1
+
+    actor.ready = True
+    coordinator.finalize()
+    assert_recoverable(tmp_path, roles, 3)
+    assert not (tmp_path / "global_step_2/actor").exists()
+    assert actor.prune_calls == 2
+    assert actor.manager.previous_saved_paths == [str(tmp_path / "global_step_3/actor")]
 
 
 @pytest.mark.parametrize("actor_only,sync_critic", [(True, False), (False, False), (False, True)])
