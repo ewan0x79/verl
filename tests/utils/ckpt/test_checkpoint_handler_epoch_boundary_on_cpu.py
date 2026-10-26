@@ -18,6 +18,8 @@ import tempfile
 
 import pytest
 import torch
+from torch.utils.data import DistributedSampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 
 class TestAtEpochBoundary:
@@ -66,7 +68,7 @@ class TestAtEpochBoundary:
 
 
 class TestLoadDataloaderState:
-    """End-to-end tests for CheckpointHandler._load_dataloader_state."""
+    """CheckpointHandler loading policy and real SFT dataloader order tests."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -74,7 +76,7 @@ class TestLoadDataloaderState:
         yield
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _make_handler(self, monkeypatch, steps_per_epoch, resume_global_step):
+    def _make_handler(self, monkeypatch, steps_per_epoch, resume_global_step, train_dataloader=None, dp_rank=0):
         monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
 
         class MockEngine:
@@ -82,7 +84,7 @@ class TestLoadDataloaderState:
                 return True
 
             def get_data_parallel_rank(self):
-                return 0
+                return dp_rank
 
         class MockDataloader:
             def __init__(self):
@@ -95,7 +97,7 @@ class TestLoadDataloaderState:
 
         handler = CheckpointHandler(
             engine=MockEngine(),
-            train_dataloader=MockDataloader(),
+            train_dataloader=MockDataloader() if train_dataloader is None else train_dataloader,
             default_local_dir=self.test_dir,
             steps_per_epoch=steps_per_epoch,
         )
@@ -137,3 +139,44 @@ class TestLoadDataloaderState:
         handler._load_dataloader_state(self.test_dir)
 
         assert handler.train_dataloader.loaded_state is None
+
+    @pytest.mark.parametrize("num_replicas,dp_rank", [(1, 0), (2, 0), (2, 1)])
+    @pytest.mark.parametrize("checkpoint_step", [3, 8])
+    def test_sft_resume_preserves_batch_order(self, monkeypatch, num_replicas, dp_rank, checkpoint_step):
+        def make_loader():
+            dataset = list(range(64))
+            sampler = DistributedSampler(dataset, num_replicas=num_replicas, rank=dp_rank, shuffle=True, drop_last=True)
+            return StatefulDataLoader(
+                dataset, batch_size=8 // num_replicas, sampler=sampler, num_workers=0, drop_last=True
+            )
+
+        continuous = make_loader()
+        expected = []
+        for epoch in range(3):
+            continuous.sampler.set_epoch(epoch)
+            for batch in continuous:
+                expected.append(batch.tolist())
+                if len(expected) == checkpoint_step:
+                    # Save before the for-loop observes StopIteration, as in SFT.
+                    torch.save(continuous.state_dict(), os.path.join(self.test_dir, f"data_{dp_rank}.pt"))
+
+        steps_per_epoch = len(continuous)
+        assert expected[:steps_per_epoch] != expected[steps_per_epoch : 2 * steps_per_epoch]
+        resumed = make_loader()
+        handler = self._make_handler(
+            monkeypatch,
+            steps_per_epoch=steps_per_epoch,
+            resume_global_step=checkpoint_step,
+            train_dataloader=resumed,
+            dp_rank=dp_rank,
+        )
+        handler._load_dataloader_state(self.test_dir)
+
+        # Both SFT trainers choose the epoch from global_step and call set_epoch
+        # before iterating; restoring an exhausted state would skip this epoch.
+        actual = expected[:checkpoint_step]
+        for epoch in range(checkpoint_step // steps_per_epoch, 3):
+            resumed.sampler.set_epoch(epoch)
+            actual.extend(batch.tolist() for batch in resumed)
+
+        assert actual == expected
