@@ -26,14 +26,19 @@ from verl.trainer.ppo.v1.trainer_base import PPOTrainer
 
 
 class _StubTrainer(PPOTrainer):
+    """Disable callbacks while exercising the production V1 dataloader path."""
+
     def on_step_end(self):
+        """Skip step callbacks in the dataloader-only test trainer."""
         pass
 
     def on_sample_end(self):
+        """Skip sample callbacks in the dataloader-only test trainer."""
         pass
 
 
 def _make_trainer(checkpoint_dir, seed, num_workers):
+    """Build a minimal V1 trainer with a real random sampler and stateful loader."""
     # Bypass model/worker initialization, but exercise the production checkpoint
     # loader and _fetch_one_gen_batch, including its StopIteration handling.
     trainer = _StubTrainer.__new__(_StubTrainer)
@@ -61,6 +66,7 @@ def _make_trainer(checkpoint_dir, seed, num_workers):
 
 
 def _fetch_indices(trainer, count):
+    """Fetch batches and return their dataset indices in traversal order."""
     return [trainer._fetch_one_gen_batch()["index"].tolist() for _ in range(count)]
 
 
@@ -69,6 +75,7 @@ def _fetch_indices(trainer, count):
     [(42, 3, 0), (None, 3, 0), (42, 8, 0), (None, 8, 0)],
 )
 def test_resume_preserves_batch_order(tmp_path, seed, checkpoint_step, num_workers):
+    """Preserve V1 sample order across mid-epoch and epoch-boundary resumes."""
     checkpoint_dir = tmp_path / f"global_step_{checkpoint_step}"
     checkpoint_dir.mkdir()
     continuous = _make_trainer(checkpoint_dir, seed, num_workers)

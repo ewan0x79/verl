@@ -67,6 +67,12 @@ class CheckpointHandler:
         lora_train_meta=None,
         steps_per_epoch=None,
     ):
+        """Configure checkpoint storage, orchestration, and dataloader restoration.
+
+        ``steps_per_epoch`` enables detection of exhausted epoch-boundary loader
+        states. Leave it as ``None`` to restore loader state regardless of the
+        checkpoint step.
+        """
         self.default_local_dir = default_local_dir
         self.max_ckpt_to_keep = max_ckpt_to_keep
         self.default_hdfs_dir = default_hdfs_dir
