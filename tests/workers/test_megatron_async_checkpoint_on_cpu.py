@@ -51,8 +51,11 @@ def _load_methods(path, class_name, methods, namespace, base=object):
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     assert {node.name for node in cls.body} == set(methods)
     module = ast.parse("from __future__ import annotations")
+    module.body.extend(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_get_async_checkpoint_queue"
+    )
     module.body.append(cls)
-    scope = dict(namespace, TestBase=base)
+    scope = dict(namespace, TestBase=base, _ASYNC_CHECKPOINT_QUEUE=None)
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
     return scope[class_name]
 
@@ -111,6 +114,10 @@ class _Queue:
             for fn in self.pending.pop(0).finalize_fns:
                 fn()
 
+    def get_num_unfinalized_calls(self):
+        """Return the number of scheduled requests awaiting finalization."""
+        return len(self.pending)
+
 
 def _manager():
     """Build a production-method manager with fake writes and real local publication markers."""
@@ -153,6 +160,7 @@ def _manager():
     manager._write_checkpoint_manifest = lambda path, *args: (Path(path) / "ckpt_contents.json").write_text("ready")
     manager.register_checkpoint = MagicMock()
     manager._async_calls_queue = _Queue()
+    manager._pending_async_saves = 0
     return manager
 
 
@@ -484,3 +492,145 @@ def test_non_megatron_async_save_rejected_before_engine_construction():
         pytest.raises(NotImplementedError, match="fsdp does not support checkpoint.async_save"),
     ):
         TrainingWorker(config)
+
+
+@pytest.mark.parametrize("reverse_finalization", [False, True])
+def test_colocated_managers_consume_results_in_process_write_order(reverse_finalization):
+    """Actor and critic finalizers must consume the same FIFO as their shared writer."""
+    results = queue.Queue()
+    metadata = {}
+    published = []
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    class ProcessWriterQueue:
+        """Model one persistent process-wide writer with FIFO callbacks for multiple managers."""
+
+        def __init__(self, persistent=False):
+            """Require persistent mode and initialize the shared pending-request sequence."""
+            assert persistent
+            self.pending = []
+
+        def schedule_async_request(self, request):
+            """Submit a writer and retain its future beside the matching request."""
+            self.pending.append((executor.submit(request.async_fn), request))
+
+        def maybe_finalize_async_calls(self, blocking=False):
+            """Consume ready writer futures in FIFO order and run their matching finalizers."""
+            while self.pending and (blocking or self.pending[0][0].done()):
+                future, request = self.pending.pop(0)
+                future.result()
+                for finalize in request.finalize_fns:
+                    finalize()
+
+        def get_num_unfinalized_calls(self):
+            """Return the number of scheduled requests awaiting finalization."""
+            return len(self.pending)
+
+    module_name = "megatron.core.dist_checkpointing.strategies.async_utils"
+    module = ModuleType(module_name)
+    module.AsyncCallsQueue = ProcessWriterQueue
+    cls = _load_methods(
+        "verl/utils/checkpoint/megatron_checkpoint_manager.py",
+        "MegatronCheckpointManager",
+        [
+            "__init__",
+            "should_save_hf_model",
+            "should_load_hf_model",
+            "_dispatch_finalize",
+            "_maybe_finalize_async_save",
+        ],
+        dict(torch=torch, _noop_async_checkpoint_write=lambda: None),
+        base=BaseCheckpointManager,
+    )
+    managers = []
+    with (
+        patch.dict(sys.modules, {module_name: module}),
+        patch.object(torch.distributed, "get_rank", return_value=0),
+        patch.object(torch.distributed, "get_world_size", return_value=1),
+    ):
+        for role in ("actor", "critic"):
+            managers.append(
+                cls(
+                    config=SimpleNamespace(model=SimpleNamespace(path="unused")),
+                    checkpoint_config=CheckpointConfig(
+                        async_save=True, save_contents=["optimizer", "extra"], load_contents=["optimizer", "extra"]
+                    ),
+                    model_config=None,
+                    transformer_config=None,
+                    role=role,
+                    model=[],
+                    arch="unused",
+                    hf_config=None,
+                    param_dtype=torch.float32,
+                    share_embeddings_and_output_weights=False,
+                    processing_class=None,
+                    optimizer=None,
+                    optimizer_scheduler=None,
+                    use_distributed_optimizer=False,
+                )
+            )
+    try:
+        for step in (1, 2):
+            for role, manager in zip(("actor", "critic"), managers, strict=True):
+                requests = []
+                for content in ("optimizer", "extra"):
+                    label = f"{step}/{role}/{content}"
+                    request = _Request()
+                    request.async_fn = lambda label=label: results.put(label)
+                    request.add_finalize_fn(lambda label=label: metadata.update({label: results.get_nowait()}))
+                    requests.append(request)
+                manager._dispatch_finalize(requests, lambda role=role, step=step: published.append((step, role)))
+        order = managers[::-1] if reverse_finalization else managers
+        for manager in order:
+            assert manager._maybe_finalize_async_save(blocking=True) is True
+    finally:
+        executor.shutdown(wait=True)
+    assert metadata == {
+        f"{s}/{r}/{c}": f"{s}/{r}/{c}" for s in (1, 2) for r in ("actor", "critic") for c in ("optimizer", "extra")
+    }
+    assert published == [(s, r) for s in (1, 2) for r in ("actor", "critic")]
+    assert managers[0]._async_calls_queue is managers[1]._async_calls_queue
+    assert results.empty()
+
+
+def test_shared_queue_reports_each_managers_own_completion():
+    """A completed actor must not wait for a later critic request to report completion."""
+    actor, critic = _manager(), _manager()
+    shared = _Queue()
+    actor._async_calls_queue = critic._async_calls_queue = shared
+    first, second = _Request(), _Request()
+    actor._dispatch_finalize([first], lambda: None)
+    critic._dispatch_finalize([second], lambda: None)
+    shared.pending[0].ready = True
+    assert actor._maybe_finalize_async_save(blocking=False) is True
+    assert critic._maybe_finalize_async_save(blocking=False) is False
+    shared.pending[0].ready = True
+    assert critic._maybe_finalize_async_save(blocking=False) is True
+
+
+def test_sync_role_drains_process_async_results_before_writing(tmp_path):
+    """A sync critic must not consume an earlier async actor's native write result."""
+    actor, critic = _manager(), _manager()
+    results = queue.Queue()
+    received = {}
+    request = _Request()
+    request.async_fn = lambda: results.put("actor")
+    request.add_finalize_fn(lambda: received.update(actor=results.get_nowait()))
+    actor._dispatch_finalize([request], lambda: None)
+    request.async_fn()
+    actor._async_calls_queue.pending[0].ready = True
+    critic.checkpoint_config.async_save = False
+    critic._async_calls_queue = None
+    critic.ensure_checkpoint_capacity = MagicMock()
+    critic.save_checkpoint.__func__.__globals__["_ASYNC_CHECKPOINT_QUEUE"] = actor._async_calls_queue
+
+    def sync_write(path, state):
+        """Enqueue and consume the critic result after older actor writes have drained."""
+        results.put("critic")
+        received["critic"] = results.get_nowait()
+
+    critic._save_dist_checkpoint = sync_write
+    critic.save_checkpoint(str(tmp_path / "global_step_1/critic"), global_step=1)
+    actor._maybe_finalize_async_save(blocking=True)
+    assert received == {"actor": "actor", "critic": "critic"}
+    assert results.empty()

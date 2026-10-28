@@ -736,6 +736,18 @@ class MegatronEngine(BaseEngine):
             self.checkpoint_mananager._maybe_finalize_async_save(blocking=False)
         return output
 
+    def finalize_async_checkpointing(self, blocking: bool = False) -> bool:
+        """Finalize queued saves on every rank and report whether all writes finished."""
+        if self.checkpoint_config is not None and self.checkpoint_config.async_save:
+            return self.checkpoint_mananager._maybe_finalize_async_save(blocking=blocking)
+        return True
+
+    supports_deferred_checkpoint_retention = True
+
+    def prune_checkpoints(self, max_ckpt_to_keep: int | None = None) -> None:
+        """Prune registered checkpoints after global tracker publication."""
+        self.checkpoint_mananager.prune_checkpoints(max_ckpt_to_keep)
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -764,6 +776,7 @@ class MegatronEngine(BaseEngine):
             global_step=global_step,
             max_ckpt_to_keep=max_ckpt_to_keep,
             blocking=blocking,
+            update_tracker=kwargs.get("update_tracker", True),
         )
         torch.distributed.barrier()
         if self._is_offload_param:

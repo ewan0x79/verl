@@ -664,7 +664,8 @@ class TestAsyncSaveFinalization:
     """Check that async completion gates tracker, HDFS, and retention publication."""
 
     @pytest.mark.parametrize("relative_path", ["global_step_3", "global_step_3/actor"])
-    def test_requests_publish_only_after_queue_finalizes_last_request(self, tmp_path, relative_path):
+    @pytest.mark.parametrize("update_tracker", [True, False])
+    def test_requests_publish_only_after_queue_finalizes_last_request(self, tmp_path, relative_path, update_tracker):
         """Require every queued request to finalize before publishing an SFT or actor checkpoint."""
         mgr = _make_manager(async_save=True)
         requests = [AsyncRequest(None, (), []), AsyncRequest(None, (), [])]
@@ -682,6 +683,10 @@ class TestAsyncSaveFinalization:
             def schedule_async_request(self, request):
                 """Append a request without running its completion callbacks."""
                 self.pending.append(request)
+
+            def get_num_unfinalized_calls(self):
+                """Return the number of scheduled requests awaiting finalization."""
+                return len(self.pending)
 
             def maybe_finalize_async_calls(self, blocking=False):
                 """Execute queued completion callbacks only for a blocking drain."""
@@ -706,18 +711,26 @@ class TestAsyncSaveFinalization:
                     global_step=3,
                     max_ckpt_to_keep=1,
                     saved_any_dist_ckpt=True,
+                    update_tracker=update_tracker,
                 ),
             )
 
-            assert mgr._async_calls_queue.pending == requests
+            assert len(mgr._async_calls_queue.pending) == len(requests)
+            assert all(callable(request.async_fn) for request in mgr._async_calls_queue.pending)
+            assert [request.finalize_fns for request in mgr._async_calls_queue.pending] == [
+                request.finalize_fns for request in requests
+            ]
             assert not tracker.exists()
             copy.assert_not_called()
-            mgr._maybe_finalize_async_save(blocking=False)
+            assert mgr._maybe_finalize_async_save(blocking=False) is False
             assert not tracker.exists()
-            mgr._maybe_finalize_async_save(blocking=True)
+            assert mgr._maybe_finalize_async_save(blocking=True) is True
 
         manifest.assert_called_once()
         copy.assert_called_once_with(src=str(step_dir), dst="hdfs://test/checkpoints", dirs_exist_ok=True)
         register.assert_called_once_with(str(step_dir), 1)
-        assert tracker.read_text() == "3"
+        if update_tracker:
+            assert tracker.read_text() == "3"
+        else:
+            assert not tracker.exists()
         assert not (tmp_path / "latest_checkpointed_iteration.txt.tmp").exists()

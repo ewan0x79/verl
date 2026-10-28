@@ -115,6 +115,19 @@ def _noop_async_checkpoint_write(*args, **kwargs):
     """Ignore request arguments so the persistent worker can signal empty-rank completion."""
 
 
+_ASYNC_CHECKPOINT_QUEUE = None
+
+
+def _get_async_checkpoint_queue():
+    """Share the request/finalizer FIFO with MCore's process-wide writer and results."""
+    global _ASYNC_CHECKPOINT_QUEUE
+    if _ASYNC_CHECKPOINT_QUEUE is None:
+        from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
+
+        _ASYNC_CHECKPOINT_QUEUE = AsyncCallsQueue(persistent=True)
+    return _ASYNC_CHECKPOINT_QUEUE
+
+
 class MegatronCheckpointManager(BaseCheckpointManager):
     """Checkpoint manager for Megatron-LM distributed training.
 
@@ -210,13 +223,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.use_megatron_fsdp = use_megatron_fsdp
         self.rank = torch.distributed.get_rank()
         self._async_calls_queue = None
+        self._pending_async_saves = 0
         if self.checkpoint_config is not None and self.checkpoint_config.async_save:
-            from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
-
-            # MCore writers share a FIFO result queue. Serialize the writes as
-            # well as their finalizers so concurrent contents/checkpoints cannot
-            # consume another writer's storage offsets.
-            self._async_calls_queue = AsyncCallsQueue(persistent=True)
+            # Colocated actor/critic managers share MCore's writer and results.
+            # Their requests and finalizers must therefore share one FIFO too.
+            self._async_calls_queue = _get_async_checkpoint_queue()
 
         # ``use_dist_checkpointing`` selects Megatron shards for the ``model``
         # slot; HF weights always go through ``bridge`` when requested by
@@ -1104,6 +1115,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         global_step: int,
         max_ckpt_to_keep,
         saved_any_dist_ckpt: bool,
+        update_tracker: bool = True,
     ) -> None:
         """Run post-write bookkeeping: manifest, HDFS upload, tracker, retention.
 
@@ -1129,7 +1141,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             # optimizer/, extra/, manifest, transformer_config.json).
             hdfs_io.copy(src=local_path, dst=hdfs_path, dirs_exist_ok=True)
 
-        if self.checkpoint_config.async_save and self.rank == 0:
+        if self.checkpoint_config.async_save and self.rank == 0 and update_tracker:
             log_with_rank(
                 f"Update latest_checkpointed_iteration.txt to step {global_step}",
                 rank=self.rank,
@@ -1148,10 +1160,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         self.register_checkpoint(local_path, max_ckpt_to_keep)
 
-    def _maybe_finalize_async_save(self, blocking: bool = False) -> None:
-        """Advance this manager's async queue from the same point on every rank."""
+    def _maybe_finalize_async_save(self, blocking: bool = False) -> bool:
+        """Advance pending writes on aligned ranks and report whether this manager finished."""
         if self._async_calls_queue is not None:
             self._async_calls_queue.maybe_finalize_async_calls(blocking=blocking)
+        return self._pending_async_saves == 0
 
     def _dispatch_finalize(self, async_requests: list, finalize_save_fn) -> None:
         """Run ``finalize_save_fn`` now, or after all async writes complete.
@@ -1169,7 +1182,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         the callback fires immediately on the calling thread.
         """
         if self.checkpoint_config.async_save and async_requests:
-            async_requests[-1].add_finalize_fn(finalize_save_fn)
+            self._pending_async_saves += 1
+
+            def finalize_owned_save():
+                """Run this save's finalizer and decrement the owner's count only after success."""
+                finalize_save_fn()
+                self._pending_async_saves -= 1
+
+            async_requests[-1].add_finalize_fn(finalize_owned_save)
             assert self._async_calls_queue is not None
             for req in async_requests:
                 # PersistentAsyncCaller skips async_fn=None without emitting a
@@ -1187,6 +1207,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         global_step: int = 0,
         max_ckpt_to_keep=None,
         blocking: bool = False,
+        update_tracker: bool = True,
     ):
         """Save a Megatron checkpoint under ``local_path`` (layout schema v2).
 
@@ -1214,7 +1235,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         ``blocking=True`` waits for all pending async writes and completion
         callbacks, including this save. Otherwise, only completed requests are
         finalized. All ranks must call this method with the same ``blocking`` value.
+
+        Set ``update_tracker=False`` when a caller coordinates multiple roles
+        and publishes their shared resume tracker after all saves complete.
         """
+        # MCore's synchronous writer consumes the same process-wide result FIFO.
+        # Finish earlier async writes before a colocated sync role can consume it.
+        if not self.checkpoint_config.async_save and _ASYNC_CHECKPOINT_QUEUE is not None:
+            _ASYNC_CHECKPOINT_QUEUE.maybe_finalize_async_calls(blocking=True)
         self._maybe_finalize_async_save(blocking=False)
         self.previous_global_step = global_step
 
@@ -1321,6 +1349,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 global_step=global_step,
                 max_ckpt_to_keep=max_ckpt_to_keep,
                 saved_any_dist_ckpt=saved_any_dist_ckpt,
+                update_tracker=update_tracker,
             ),
         )
         self._maybe_finalize_async_save(blocking=blocking)
