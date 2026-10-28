@@ -1,4 +1,4 @@
-昇腾安装指南(Ascend 950PR&DT系列产品)
+昇腾安装指南(Ascend 950PR&950DT系列产品)
 =================
 
 Last updated: 09/22/2026.
@@ -17,7 +17,7 @@ Last updated: 09/22/2026.
 框架后端支持说明
 ----------------
 
-当前NPU在Ascend 950PR&DT系列产品上支持以下常见训推后端的部署，您可以根据我们的 `昇腾镜像说明 <dockerfile_build_guidance.rst>`__ 直接获取发布的镜像，也可以根据下文进行自定义安装。
+当前NPU在Ascend 950PR&950DT系列产品上支持以下常见训推后端的部署，您可以根据我们的 `昇腾镜像说明 <dockerfile_build_guidance.rst>`__ 直接获取发布的镜像，也可以根据下文进行自定义安装。
 
 .. list-table::
    :header-rows: 1
@@ -79,7 +79,7 @@ Megatron 训练后端还需安装以下 Bridge 组件：
 安装前准备（ CANN）
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
-CANN是NPU上的异构计算架构，以下为arm平台A3安装指令，请参照如下指令下载HDK和CANN并安装，
+CANN是NPU上的异构计算架构，以下为arm平台950PR&DT系列产品安装指令，请参照如下指令下载HDK和CANN并安装，
 或者根据系统硬件型号从 `CANN社区 <https://www.hiascend.com/cann/download?versionId=723&ids=d803%2Ch0501%2Ch0601%2Ch0702>`_ 下载安装
 
 .. code:: bash
