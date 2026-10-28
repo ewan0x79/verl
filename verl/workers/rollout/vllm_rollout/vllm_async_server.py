@@ -53,7 +53,6 @@ from verl.utils.profiler import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
-from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
@@ -318,7 +317,12 @@ class vLLMHttpServer:
 
             set_expandable_segments(True)
 
-        quantization, hf_overrides = self._apply_quantization()
+        hf_overrides = self._apply_quantization()
+        hf_quantization_config = getattr(self.model_config.hf_config, "quantization_config", None)
+        effective_quantization_config = hf_overrides.get("quantization_config") or hf_quantization_config
+        from verl.utils.vllm.vllm_quant_utils import set_default_vllm_quantization_backends
+
+        set_default_vllm_quantization_backends(effective_quantization_config, engine_kwargs)
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -358,7 +362,6 @@ class vLLMHttpServer:
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "seed": self.replica_rank + self.config.seed,
             "override_generation_config": json.dumps(override_generation_config),
-            "quantization": quantization,
             "hf_overrides": hf_overrides,
             "scheduling_policy": self.config.scheduling_policy,
             "compilation_config": compilation_config,
@@ -409,10 +412,22 @@ class vLLMHttpServer:
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
+            if self.node_rank > 0:
+                # Only the headless follower nodes get a start rank. Since vLLM 0.28 a
+                # non-headless server that receives ``data_parallel_start_rank`` is put
+                # into hybrid-LB mode (EngineArgs.create_engine_config), and in that
+                # mode the leader rejects headless remote engines with
+                # "Remote engine N must not use --headless in external or hybrid dp lb
+                # mode". The node-0 API server is the internal-LB leader and must not
+                # carry a start rank (its local engines start at rank 0 anyway).
+                dp_args["data_parallel_start_rank"] = self.node_rank * data_parallel_size_local
+            else:
+                # A start rank configured through engine_kwargs would put the leader into
+                # hybrid-LB mode just the same; the leader's engines always start at rank 0.
+                args.pop("data_parallel_start_rank", None)
             args.update(dp_args)
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
@@ -915,6 +930,9 @@ class vLLMHttpServer:
             session_id=session_id,
         )
 
+    @RLInsightLogger.trace_state_decorator(
+        "wake_up", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
+    )
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
             return
@@ -936,6 +954,9 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
+    @RLInsightLogger.trace_state_decorator(
+        "sleep", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
+    )
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
@@ -947,6 +968,9 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    @RLInsightLogger.trace_state_decorator(
+        "clear_kv_cache", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
+    )
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
@@ -958,6 +982,9 @@ class vLLMHttpServer:
             await self.engine.reset_mm_cache()
             await self.engine.reset_encoder_cache()
 
+    @RLInsightLogger.trace_state_decorator(
+        "release_kv_cache", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
+    )
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""
         # TODO: use the real release_kv_cache() method after vllm supports it (vllm#44890/46438)
@@ -968,6 +995,9 @@ class vLLMHttpServer:
         await self.engine.sleep(level=self._resolve_sleep_level())
         await self.engine.wake_up(tags=["weights"])
 
+    @RLInsightLogger.trace_state_decorator(
+        "resume_kv_cache", state_lane_id=lambda self: ray.get_runtime_context().get_actor_name()
+    )
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
         if self.node_rank != 0 or not self.config.free_cache_engine:
@@ -1167,7 +1197,7 @@ class vLLMHttpServer:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
 
-            # pause_generation with wait_for_inflight_requests=False will:
+            # pause_generation in abort mode will:
             # 1. Set engine to paused state (new requests are accepted but not scheduled)
             # 2. Abort all in-flight requests
             # 3. Wait for requests to drain
@@ -1177,10 +1207,13 @@ class vLLMHttpServer:
             #    MooncakeStoreConnector) is invalidated along with the
             #    local prefix cache — RL-correct hard-reset at every
             #    weight update boundary, no extra kwargs needed.
-            await self.engine.pause_generation(
-                wait_for_inflight_requests=False,
-                clear_cache=reset_prefix_cache,
-            )
+            if _VLLM_VERSION >= version.parse("0.32.0"):
+                await self.engine.pause_generation(mode="abort", clear_cache=reset_prefix_cache)
+            else:
+                await self.engine.pause_generation(
+                    wait_for_inflight_requests=False,
+                    clear_cache=reset_prefix_cache,
+                )
 
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
@@ -1392,69 +1425,20 @@ class vLLMHttpServer:
             max_new_tokens=self.config.response_length,
         )
 
-    def _apply_quantization(self) -> tuple[Optional[str], dict]:
-        """Process quantization config. Returns (quantization_str, hf_overrides)."""
+    def _apply_quantization(self) -> dict:
+        """hf_overrides for a rollout quantization set in the rollout config.
+
+        Models shipping their own ``quantization_config`` need nothing here; either way the
+        workers install the refit patches from the resulting vLLM ``quant_config``.
+        """
         quantization = self.config.quantization
-        hf_overrides = {}
+        if not quantization.enabled:
+            return {}
 
-        # Handle QAT (Quantization-Aware Training) configuration
-        qat_config_dict = getattr(self.config, "qat", {}) or {}
-        if qat_config_dict.get("enable", False):
-            from verl.utils.qat import QATConfig, load_quantization_config
-
-            qat_config = QATConfig(**qat_config_dict)
-            quantization_config_dict = load_quantization_config(qat_config)
-            quant_method = quantization_config_dict.get("quant_method", None)
-
-            if quant_method == "modelopt":
-                from verl.utils.modelopt import apply_modelopt_nvfp4_patches
-
-                apply_modelopt_nvfp4_patches()
-                quantization = "modelopt"
-            elif quant_method == "compressed-tensors":
-                from verl.utils.qat import apply_qat_patches
-
-                apply_qat_patches()
-                quantization = "compressed-tensors"
-            else:
-                raise ValueError(f"Unsupported quant_method: {quant_method}")
-
-            logger.info(f"QAT quantization config injected (quant_method={quant_method})")
-            hf_overrides["quantization_config"] = quantization_config_dict
-        elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
-            if quantization not in _SUPPORTED_QUANTIZATION:
-                raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
-
-            if quantization == "fp8":
-                # Ignore MoE router layers for FP8 quantization
-                all_mlp_gate_layers = []
-                for layer in range(self.model_config.hf_config.num_hidden_layers):
-                    all_mlp_gate_layers.append(f"model.layers.{layer}.mlp.gate")
-
-                FP8_BLOCK_QUANT_KWARGS = {
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                    "ignored_layers": all_mlp_gate_layers,
-                }
-                hf_overrides["quantization_config"] = dict(FP8_BLOCK_QUANT_KWARGS)
-                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
-                apply_vllm_quant_patches()
-                # for subprocesses patching
-                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
-
-        model_quantization_config = getattr(self.model_config.hf_config, "quantization_config", {}) or {}
-        if quantization is None and model_quantization_config.get("quant_method") == "fp8":
-            apply_vllm_quant_patches()
-            os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
-
-        if quantization is not None and self.config.quantization_config_file is not None:
-            hf_overrides["quantization_config_file"] = self.config.quantization_config_file
-
-        return quantization, hf_overrides
+        # The trainer quantizes every refit to this config; vLLM picks the method up from hf_overrides.
+        quantization_config = quantization.build_quantization_config(self.model_config.local_path)
+        logger.info(f"Rollout compressed-tensors quantization_config: {quantization_config}")
+        return {"quantization_config": quantization_config}
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""
