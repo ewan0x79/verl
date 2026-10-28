@@ -32,7 +32,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 
 from verl.trainer.config import CheckpointConfig
-from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
+from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager, _noop_async_checkpoint_write
 
 # ---------------------------------------------------------------------------
 # Session-scoped: initialize torch.distributed + megatron parallel state once
@@ -667,7 +667,10 @@ class TestAsyncSaveFinalization:
     def test_requests_publish_only_after_queue_finalizes_last_request(self, tmp_path, relative_path):
         """Require every queued request to finalize before publishing an SFT or actor checkpoint."""
         mgr = _make_manager(async_save=True)
-        requests = [AsyncRequest(None, (), []), AsyncRequest(None, (), [])]
+        requests = [
+            AsyncRequest(None, ("model",), [], {"rank": 0}),
+            AsyncRequest(None, ("optimizer",), [], {"rank": 1}),
+        ]
         step_dir = tmp_path / relative_path
         step_dir.mkdir(parents=True)
         tracker = tmp_path / "latest_checkpointed_iteration.txt"
@@ -709,7 +712,11 @@ class TestAsyncSaveFinalization:
                 ),
             )
 
-            assert mgr._async_calls_queue.pending == requests
+            pending = mgr._async_calls_queue.pending
+            assert len(pending) == len(requests)
+            for queued, original in zip(pending, requests, strict=True):
+                assert queued.async_fn is _noop_async_checkpoint_write
+                assert queued._replace(async_fn=original.async_fn) == original
             assert not tracker.exists()
             copy.assert_not_called()
             mgr._maybe_finalize_async_save(blocking=False)
