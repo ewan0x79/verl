@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import replace
 from enum import Enum
 
@@ -49,7 +50,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     """
 
     # Default for instances that bypass __init__ (e.g. test stubs): hybrid
-    # replicas are enabled unless actor_rollout_ref.hybrid_engine=False.
+    # replicas are enabled unless hybrid_rollout.enable_switch=False.
     _enable_hybrid_replicas = True
 
     def __init__(self, config: DictConfig):
@@ -75,23 +76,28 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 "Use standalone mode (reward.reward_model.enable_resource_pool=True) instead."
             )
 
-        # actor_rollout_ref.hybrid_engine=False disables the colocated (hybrid)
-        # rollout replicas on the training GPUs: rollout is then served
-        # exclusively by the standalone rollout pool (v0 fully-async semantics).
-        # Read by PPOTrainer._setup() (triggered by init()).
-        self._enable_hybrid_replicas = bool(config.actor_rollout_ref.get("hybrid_engine", True))
-
         super().__init__(config)
 
+        # Hybrid replicas on the training GPUs exist only to be lent to generation
+        # between steps: without enable_switch they would sleep through all
+        # steady-state training and only ever serve warmup and validation, while
+        # permanently costing engine init, a startup weight sync, and the offload /
+        # memory headroom their wake-ups require. They are therefore created only
+        # when enable_switch=True. actor_rollout_ref.hybrid_engine=False (the v0
+        # fully-async convention) keeps its "no colocated replicas" meaning and
+        # wins over a conflicting enable_switch=True, which is ignored with a
+        # warning instead of failing startup.
         self.hybrid_rollout_config: HybridRolloutSwitchConfig = omega_conf_to_dataclass(
             self.config.trainer.v1.separate_async.hybrid_rollout
         )
-        if not self._enable_hybrid_replicas and self.hybrid_rollout_config.enable_switch:
+        if not bool(config.actor_rollout_ref.get("hybrid_engine", True)) and self.hybrid_rollout_config.enable_switch:
             logger.warning(
                 "trainer.v1.separate_async.hybrid_rollout.enable_switch is ignored because "
                 "actor_rollout_ref.hybrid_engine=False; disabling hybrid switching"
             )
             self.hybrid_rollout_config = replace(self.hybrid_rollout_config, enable_switch=False)
+        # Read by PPOTrainer._setup() (triggered by init()).
+        self._enable_hybrid_replicas = self.hybrid_rollout_config.enable_switch
         if self.hybrid_rollout_config.enable_switch:
             # No support for PD disaggregation for switching
             rollout_cfg = self.config.get("actor_rollout_ref", {}).get("rollout", {})
@@ -151,8 +157,15 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # initialize standalone rollout
         # TODO: make initialization parallel with super().init()
         hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)
+        # Standalone replicas have dedicated GPUs; keep their memory budget
+        # separate from the hybrid replicas that share GPUs with training.
+        standalone_config = deepcopy(self.config)
+        standalone_rollout_config = standalone_config.actor_rollout_ref.rollout
+        standalone_memory = standalone_rollout_config.get("standalone_gpu_memory_utilization")
+        if standalone_memory is not None:
+            standalone_rollout_config.gpu_memory_utilization = standalone_memory
         self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, start_rank=hybrid_num_replicas
+            config=standalone_config, start_rank=hybrid_num_replicas
         )
         rollout_config = self.config.actor_rollout_ref.rollout
         if rollout_config.prometheus.enable:
@@ -174,14 +187,15 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self.current_mode = HybridEngineMode.ROLLOUT
             self.add_replicas_to_balancer()
         else:
-            # No colocated replicas exist on the training GPUs (hybrid_engine=False):
+            # No colocated replicas exist on the training GPUs (the default;
+            # they are only created when hybrid_rollout.enable_switch=True):
             # rollout is served exclusively by the standalone pool, so never enter
             # ROLLOUT mode; the mode-switch hooks and balancer updates become no-ops.
             self.current_mode = HybridEngineMode.TRAINER
             logger.info(
-                "[V1SepAsync] hybrid replicas disabled (actor_rollout_ref.hybrid_engine=False): "
-                f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only",
-                flush=True,
+                "[V1SepAsync] no hybrid replicas on the training GPUs "
+                "(trainer.v1.separate_async.hybrid_rollout.enable_switch=False): "
+                f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only"
             )
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
