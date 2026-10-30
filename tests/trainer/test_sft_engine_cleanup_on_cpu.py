@@ -71,6 +71,11 @@ def _mock_python(arguments):
     assert f"trainer.default_local_dir={checkpoint}" in arguments
     expected_resume = os.environ["SFT_TEST_EXPECTED_RESUME_MODE"]
     assert f"trainer.resume_mode={expected_resume}" in arguments
+    expected_path = os.environ["SFT_TEST_EXPECTED_RESUME_PATH"]
+    path_arguments = [arg for arg in arguments if arg.startswith("trainer.resume_from_path=")]
+    assert path_arguments == ([f"trainer.resume_from_path={expected_path}"] if expected_path else [])
+    assert ("+checkpoint.async_save=True" in arguments) == (os.environ["ASYNC_SAVE"] == "True")
+    (checkpoint.parent / "training-arguments.json").write_text(json.dumps(arguments))
     (checkpoint.parent / "training-entry.json").write_text(json.dumps(_state(checkpoint)))
     output = checkpoint / "global_step_3/output.marker"
     output.parent.mkdir()
@@ -80,20 +85,8 @@ def _mock_python(arguments):
     return int(os.environ["SFT_TEST_EXIT_CODE"])
 
 
-@pytest.mark.parametrize("mode", ["spmd", "ray"])
-@pytest.mark.parametrize("exit_code", [0, 37], ids=["success", "failure"])
-@pytest.mark.parametrize(
-    "resume_mode",
-    [None, "", "disable", "auto", "resume_path"],
-    ids=["default", "resume-empty", "disable", "auto", "resume-path"],
-)
-@pytest.mark.parametrize(
-    "keep",
-    [None, "", "False", "True", "true"],
-    ids=["keep-default", "keep-empty", "keep-false", "keep-true", "keep-lowercase"],
-)
-def test_sft_engine_checkpoint_cleanup(tmp_path, mode, exit_code, resume_mode, keep):
-    """Preserve resume inputs by default and honor explicit cleanup on success or failure."""
+def _run_sft_engine(tmp_path, mode, exit_code, resume_mode, keep, resume_from_path=None, async_save="True"):
+    """Run the actual script with isolated checkpoint files and command substitutes."""
     effective_resume = resume_mode or "disable"
     root = tmp_path.resolve()
     (root / ".sft-shell-test").write_text("isolated cleanup test\n")
@@ -127,14 +120,17 @@ def test_sft_engine_checkpoint_cleanup(tmp_path, mode, exit_code, resume_mode, k
         "SFT_TEST_RM": shutil.which("rm"),
         "SFT_TEST_EXIT_CODE": str(exit_code),
         "SFT_TEST_EXPECTED_RESUME_MODE": effective_resume,
+        "SFT_TEST_EXPECTED_RESUME_PATH": (resume_from_path or "") if effective_resume == "resume_path" else "",
         # Populate the override array: Bash 3.2 treats an empty array under
         # nounset as unbound. This flag does not participate in shell cleanup.
-        "ASYNC_SAVE": "True",
+        "ASYNC_SAVE": async_save,
     }
     if resume_mode is not None:
         environment["RESUME_MODE"] = resume_mode
     if keep is not None:
         environment["KEEP_CHECKPOINTS"] = keep
+    if resume_from_path is not None:
+        environment["RESUME_FROM_PATH"] = resume_from_path
     script = Path(__file__).resolve().parents[2] / "tests/special_e2e/sft/run_sft_engine.sh"
     result = subprocess.run(
         [shutil.which("bash"), str(script)],
@@ -145,6 +141,26 @@ def test_sft_engine_checkpoint_cleanup(tmp_path, mode, exit_code, resume_mode, k
         timeout=30,
         check=False,
     )
+    return root, checkpoint, result
+
+
+@pytest.mark.parametrize("mode", ["spmd", "ray"])
+@pytest.mark.parametrize("exit_code", [0, 37], ids=["success", "failure"])
+@pytest.mark.parametrize(
+    "resume_mode",
+    [None, "", "disable", "auto", "resume_path"],
+    ids=["default", "resume-empty", "disable", "auto", "resume-path"],
+)
+@pytest.mark.parametrize(
+    "keep",
+    [None, "", "False", "True", "true"],
+    ids=["keep-default", "keep-empty", "keep-false", "keep-true", "keep-lowercase"],
+)
+def test_sft_engine_checkpoint_cleanup(tmp_path, mode, exit_code, resume_mode, keep):
+    """Preserve resume inputs by default and honor explicit cleanup on success or failure."""
+    effective_resume = resume_mode or "disable"
+    resume_from_path = str(tmp_path.resolve() / "checkpoints/global_step_2") if resume_mode == "resume_path" else None
+    root, checkpoint, result = _run_sft_engine(tmp_path, mode, exit_code, resume_mode, keep, resume_from_path)
     assert result.returncode == exit_code, result.stderr
     entry = json.loads((root / "training-entry.json").read_text())
     before_exit = json.loads((root / "training-exit.json").read_text())
@@ -160,7 +176,53 @@ def test_sft_engine_checkpoint_cleanup(tmp_path, mode, exit_code, resume_mode, k
         "tracker": retain,
     }
     assert checkpoint.is_dir()
-    assert outside.read_text() == "outside checkpoint directory\n"
+    assert (root / "outside.marker").read_text() == "outside checkpoint directory\n"
+
+
+@pytest.mark.parametrize("mode", ["spmd", "ray"])
+@pytest.mark.parametrize("resume_from_path", [None, ""], ids=["missing", "empty"])
+@pytest.mark.parametrize("keep", [None, "False"], ids=["default", "explicit-cleanup"])
+def test_resume_path_requires_path_before_training_or_cleanup(tmp_path, mode, resume_from_path, keep):
+    """Reject missing paths before training or any checkpoint cleanup can start."""
+    root, checkpoint, result = _run_sft_engine(tmp_path, mode, 0, "resume_path", keep, resume_from_path)
+    assert result.returncode != 0
+    assert "RESUME_FROM_PATH is required when RESUME_MODE=resume_path" in result.stderr
+    assert not (root / "training-entry.json").exists()
+    assert not (root / "training-arguments.json").exists()
+    assert _state(checkpoint) == {"input": True, "generated": False, "notes": True, "hidden": True, "tracker": True}
+    assert (root / "outside.marker").read_text() == "outside checkpoint directory\n"
+
+
+@pytest.mark.parametrize("mode", ["spmd", "ray"])
+@pytest.mark.parametrize("async_save", ["False", "True"])
+@pytest.mark.parametrize("exit_code", [0, 37], ids=["success", "failure"])
+def test_resume_path_preserves_argument_and_external_input(tmp_path, mode, async_save, exit_code):
+    """Forward a path with spaces through shell and Hydra without cleaning its source."""
+    from hydra.core.override_parser.overrides_parser import OverridesParser
+
+    source = tmp_path.resolve() / "resume inputs/global_step_2"
+    source.mkdir(parents=True)
+    marker = source / "input.marker"
+    marker.write_text("external synthetic resume input\n")
+    root, checkpoint, result = _run_sft_engine(
+        tmp_path, mode, exit_code, "resume_path", "False", str(source), async_save
+    )
+    assert result.returncode == exit_code, result.stderr
+    arguments = json.loads((root / "training-arguments.json").read_text())
+    override = next(arg for arg in arguments if arg.startswith("trainer.resume_from_path="))
+    assert OverridesParser.create().parse_override(override).value() == str(source)
+    assert marker.read_text() == "external synthetic resume input\n"
+    assert _state(checkpoint) == {"input": False, "generated": False, "notes": False, "hidden": True, "tracker": False}
+
+
+@pytest.mark.parametrize("mode", ["spmd", "ray"])
+@pytest.mark.parametrize("resume_mode", ["disable", "auto"])
+def test_resume_path_variable_does_not_change_other_modes(tmp_path, mode, resume_mode):
+    """Keep the optional environment variable inactive outside explicit-path recovery."""
+    root, _, result = _run_sft_engine(tmp_path, mode, 0, resume_mode, None, str(tmp_path / "unused input"))
+    assert result.returncode == 0, result.stderr
+    arguments = json.loads((root / "training-arguments.json").read_text())
+    assert not any(arg.startswith("trainer.resume_from_path=") for arg in arguments)
 
 
 if __name__ == "__main__":

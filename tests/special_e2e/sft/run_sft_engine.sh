@@ -36,6 +36,10 @@ checkpoint_overrides=()
 if [ "${ASYNC_SAVE:-False}" = "True" ]; then
     checkpoint_overrides+=(+checkpoint.async_save=True)
 fi
+if [ "${RESUME_MODE}" = "resume_path" ]; then
+    : "${RESUME_FROM_PATH:?RESUME_FROM_PATH is required when RESUME_MODE=resume_path}"
+    checkpoint_overrides+=("trainer.resume_from_path=${RESUME_FROM_PATH}")
+fi
 
 ckpts_home=${ckpts_home:-~/verl/test/gsm8k-sft-${backend}}
 
