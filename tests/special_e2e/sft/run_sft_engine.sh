@@ -25,7 +25,12 @@ RESUME_MODE=${RESUME_MODE:-disable}
 TOTAL_TRAIN_STEP=${TOTAL_TRAIN_STEP:-2}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 TEST_FREQ=${TEST_FREQ:-after_each_epoch}
-KEEP_CHECKPOINTS=${KEEP_CHECKPOINTS:-False}
+# Resume runs retain checkpoints unless cleanup is explicitly requested.
+if [ "${RESUME_MODE}" = "disable" ]; then
+    KEEP_CHECKPOINTS=${KEEP_CHECKPOINTS:-False}
+else
+    KEEP_CHECKPOINTS=${KEEP_CHECKPOINTS:-True}
+fi
 
 checkpoint_overrides=()
 if [ "${ASYNC_SAVE:-False}" = "True" ]; then
