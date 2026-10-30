@@ -65,6 +65,23 @@ def _state(checkpoint):
     }
 
 
+def _resolve_resume_path(arguments, root):
+    """Compose and resolve the actual override through Hydra and OmegaConf."""
+    from hydra import compose, initialize_config_dir
+    from hydra.core.override_parser.overrides_parser import OverridesParser
+    from omegaconf import OmegaConf
+
+    assert len(arguments) == 1
+    assert not OverridesParser.create().parse_override(arguments[0]).is_sweep_override()
+    config_dir = root / "hydra-config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("trainer:\n  resume_from_path: null\n")
+    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+        config = compose(config_name="config", overrides=arguments)
+        resolved = OmegaConf.to_container(config, resolve=True)
+    return resolved["trainer"]["resume_from_path"]
+
+
 def _mock_python(arguments):
     """Record startup effects, synthesize a save, then return the requested exit code."""
     checkpoint = _checkpoint_root()
@@ -73,7 +90,14 @@ def _mock_python(arguments):
     assert f"trainer.resume_mode={expected_resume}" in arguments
     expected_path = os.environ["SFT_TEST_EXPECTED_RESUME_PATH"]
     path_arguments = [arg for arg in arguments if arg.startswith("trainer.resume_from_path=")]
-    assert path_arguments == ([f"trainer.resume_from_path={expected_path}"] if expected_path else [])
+    if expected_path:
+        resolved_path = _resolve_resume_path(path_arguments, checkpoint.parent)
+        assert isinstance(resolved_path, str) and resolved_path == expected_path
+        assert Path(resolved_path).is_dir()
+    else:
+        assert not path_arguments
+        resolved_path = None
+    (checkpoint.parent / "training-config.json").write_text(json.dumps({"resume_from_path": resolved_path}))
     assert ("+checkpoint.async_save=True" in arguments) == (os.environ["ASYNC_SAVE"] == "True")
     (checkpoint.parent / "training-arguments.json").write_text(json.dumps(arguments))
     (checkpoint.parent / "training-entry.json").write_text(json.dumps(_state(checkpoint)))
@@ -197,8 +221,7 @@ def test_resume_path_requires_path_before_training_or_cleanup(tmp_path, mode, re
 @pytest.mark.parametrize("async_save", ["False", "True"])
 @pytest.mark.parametrize("exit_code", [0, 37], ids=["success", "failure"])
 def test_resume_path_preserves_argument_and_external_input(tmp_path, mode, async_save, exit_code):
-    """Forward a path with spaces through shell and Hydra without cleaning its source."""
-    from hydra.core.override_parser.overrides_parser import OverridesParser
+    """Preserve an absolute path through config resolution and source cleanup."""
 
     source = tmp_path.resolve() / "resume inputs/global_step_2"
     source.mkdir(parents=True)
@@ -208,9 +231,8 @@ def test_resume_path_preserves_argument_and_external_input(tmp_path, mode, async
         tmp_path, mode, exit_code, "resume_path", "False", str(source), async_save
     )
     assert result.returncode == exit_code, result.stderr
-    arguments = json.loads((root / "training-arguments.json").read_text())
-    override = next(arg for arg in arguments if arg.startswith("trainer.resume_from_path="))
-    assert OverridesParser.create().parse_override(override).value() == str(source)
+    resolved = json.loads((root / "training-config.json").read_text())
+    assert resolved["resume_from_path"] == str(source)
     assert marker.read_text() == "external synthetic resume input\n"
     assert _state(checkpoint) == {"input": False, "generated": False, "notes": False, "hidden": True, "tracker": False}
 
@@ -223,6 +245,43 @@ def test_resume_path_variable_does_not_change_other_modes(tmp_path, mode, resume
     assert result.returncode == 0, result.stderr
     arguments = json.loads((root / "training-arguments.json").read_text())
     assert not any(arg.startswith("trainer.resume_from_path=") for arg in arguments)
+
+
+@pytest.mark.parametrize("mode", ["spmd", "ray"])
+@pytest.mark.parametrize(
+    "resume_path",
+    [
+        pytest.param("run,backup/global_step_2", id="comma"),
+        pytest.param("run'backup/global_step_2", id="single-quote"),
+        pytest.param('run"backup/global_step_2', id="double-quote"),
+        pytest.param(r"run\backup/global_step_2", id="backslash"),
+        pytest.param(r"run\"backup/global_step_2", id="backslash-quote"),
+        pytest.param("global_step_2\\", id="trailing-backslash"),
+        pytest.param("global_step_2\\\\", id="trailing-backslashes"),
+        pytest.param("run[1]{two}(three)=value:part/global_step_2", id="punctuation"),
+        pytest.param("  global_step_2  ", id="surrounding-whitespace"),
+        pytest.param("${missing}/global_step_2", id="interpolation"),
+        pytest.param("${oc.env:SFT_TEST_EXIT_CODE}/global_step_2", id="resolver"),
+        pytest.param(r"\${missing}/global_step_2", id="escaped-interpolation"),
+        pytest.param(r"\\${missing}/global_step_2", id="double-escaped-interpolation"),
+        pytest.param('${missing}\\"quote/global_step_2\\', id="mixed-escapes"),
+        pytest.param("${unclosed/global_step_2", id="unclosed-interpolation"),
+        pytest.param("${first}${second}/global_step_2", id="adjacent-interpolations"),
+        pytest.param("run\tline\nbackup/global_step_2", id="tab-and-newline"),
+        pytest.param("\u6a21\u578b,\u5907\u4efd/global_step_2", id="unicode"),
+    ],
+)
+def test_resume_path_encoding_roundtrip(tmp_path, mode, resume_path):
+    """Keep punctuation, escapes and interpolation-shaped text literal after resolution."""
+    source = tmp_path.resolve() / resume_path
+    source.mkdir(parents=True)
+    marker = source / "input.marker"
+    marker.write_text("literal-path input\n")
+    root, _, result = _run_sft_engine(tmp_path, mode, 0, "resume_path", "True", resume_path)
+    assert result.returncode == 0, result.stderr
+    resolved = json.loads((root / "training-config.json").read_text())
+    assert resolved["resume_from_path"] == resume_path
+    assert marker.read_text() == "literal-path input\n"
 
 
 if __name__ == "__main__":

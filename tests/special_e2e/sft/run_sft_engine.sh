@@ -38,7 +38,28 @@ if [ "${ASYNC_SAVE:-False}" = "True" ]; then
 fi
 if [ "${RESUME_MODE}" = "resume_path" ]; then
     : "${RESUME_FROM_PATH:?RESUME_FROM_PATH is required when RESUME_MODE=resume_path}"
-    checkpoint_overrides+=("trainer.resume_from_path=${RESUME_FROM_PATH}")
+    # Quote for Hydra and escape OmegaConf interpolation-shaped text literally.
+    # Before a quote or ${, N backslashes need 2N+1; trailing ones need 2N.
+    # Bash may iterate over UTF-8 bytes; do not trace incomplete characters.
+    set +x
+    resume_path_value=""
+    resume_path_backslashes=""
+    for ((resume_path_index=0; resume_path_index<${#RESUME_FROM_PATH}; resume_path_index++)); do
+        resume_path_char="${RESUME_FROM_PATH:resume_path_index:1}"
+        if [[ "$resume_path_char" == '\' ]]; then
+            resume_path_backslashes+='\'
+            continue
+        fi
+        if [[ "$resume_path_char" == '"' || "${RESUME_FROM_PATH:resume_path_index:2}" == '${' ]]; then
+            resume_path_value+="${resume_path_backslashes}${resume_path_backslashes}\\${resume_path_char}"
+        else
+            resume_path_value+="${resume_path_backslashes}${resume_path_char}"
+        fi
+        resume_path_backslashes=""
+    done
+    resume_path_value+="${resume_path_backslashes}${resume_path_backslashes}"
+    set -x
+    checkpoint_overrides+=("trainer.resume_from_path=\"${resume_path_value}\"")
 fi
 
 ckpts_home=${ckpts_home:-~/verl/test/gsm8k-sft-${backend}}
